@@ -1,0 +1,10 @@
+# 构建上下文排除项
+.cache/
+data/
+*.zip
+.git/
+.gitignore
+docs/
+README.md
+Dockerfile
+.dockerignore

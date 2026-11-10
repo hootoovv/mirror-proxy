@@ -1,0 +1,143 @@
+# =============================================================================
+# mirror-proxy 配置文件
+#
+#   * 每种源类型（apt / yum / pip / npm / mvn）可配置多个上游，回源时按
+#     列表顺序依次尝试（网络错误 / 5xx / 404 自动切换下一个）。
+#   * 客户端把软件源地址改为 http://<本机>:8080/<route> 即可接入。
+#   * 环境变量覆盖：MIRROR_PROXY_ADDR、MIRROR_PROXY_CACHE_DIR。
+# =============================================================================
+
+server:
+  # 监听地址
+  addr: ":8080"
+
+  # 缓存根目录（相对路径基于工作目录）。
+  # 目录布局：<cache_dir>/<源类型>/<文件名前2字符>/<请求路径中的子目录层>/<文件名>
+  # 例如 apt 的 Ubuntu jammy 索引会存为：
+  #   .cache/apt/In/ubuntu/dists/jammy/InRelease
+  #   .cache/apt/Pa/ubuntu/dists/jammy/main/binary-amd64/Packages.gz
+  #   .cache/apt/Pa/ubuntu/dists/noble/main/binary-amd64/Packages.gz   ← noble 版本自动分层
+  # Docker 中建议通过环境变量 MIRROR_PROXY_CACHE_DIR=/data/.cache 指向持久卷。
+  cache_dir: ".cache"
+
+  # 对外基础 URL（JSON 链接重写使用，如 npm 元数据中的 tarball 地址）。
+  # 留空则按每个请求的 Host 头自动推断，多出口地址时无需配置。
+  public_base_url: ""
+
+  # 允许整体读入内存做链接重写的响应体上限（字节）。超过该尺寸的 HTML/JSON
+  # 将直接流式转发（仍会缓存，只是不做重写）。
+  max_rewrite_size: 67108864   # 64MiB
+
+  # 等待上游返回响应头的超时（防止上游僵死）。
+  response_header_timeout: 30s
+
+  # 所有上游的单请求默认总超时；0 = 不限制（大文件下载可能很久）。
+  # 可被单个 upstream 的 timeout 覆盖。
+  upstream_timeout: 0s
+
+sources:
+  # ---------------------------------------------------------------------------
+  # Ubuntu/Debian apt 源。客户端把 sources.list 中的
+  #   deb http://mirrors.aliyun.com/ubuntu/ jammy main ...
+  # 改为
+  #   deb http://<proxy>:8080/apt/ jammy main ...
+  # ---------------------------------------------------------------------------
+  apt:
+    route: /apt
+    upstreams:
+      - name: aliyun-ubuntu
+        base_url: https://mirrors.aliyun.com/ubuntu
+      - name: tuna-ubuntu
+        base_url: https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+      - name: ustc-ubuntu
+        base_url: https://mirrors.ustc.edu.cn/ubuntu
+    # 索引类文件的再校验周期：0 = 永久缓存（快照式，apt 校验内部自洽）。
+    # 注意：apt/yum 开启 TTL 后可能出现"Release 已刷新而 Packages.gz 仍为旧
+    # 快照"的窗口，触发客户端哈希校验失败，因此默认关闭。需要追随上游更新
+    # 时可设为 6h 并接受该风险，或定期 /purge 索引目录。
+    index_ttl: 0s
+    index_patterns:
+      - "^dists/"
+
+  # ---------------------------------------------------------------------------
+  # CentOS yum/dnf 源。客户端 .repo 中使用：
+  #   baseurl=http://<proxy>:8080/yum/$releasever/os/$basearch/
+  # （必须用 baseurl 而不是 mirrorlist。）
+  # ---------------------------------------------------------------------------
+  yum:
+    route: /yum
+    upstreams:
+      - name: aliyun-centos
+        base_url: https://mirrors.aliyun.com/centos
+      - name: tuna-centos
+        base_url: https://mirrors.tuna.tsinghua.edu.cn/centos
+      # CentOS 7/8 已 EOL，软件包在 vault；需要时取消注释并调整 baseurl：
+      # - name: centos-vault
+      #   base_url: https://vault.centos.org
+    index_ttl: 0s
+    index_patterns:
+      - "(?:^|/)repodata/"
+
+  # ---------------------------------------------------------------------------
+  # pip 源。客户端：
+  #   pip config set global.index-url http://<proxy>:8080/pip/simple
+  #   pip config set global.trusted-host <proxy>   # http 源需要
+  # 上游 base_url 只填到 /pypi 一级：代理会把 /pip/<rest> 映射为
+  # <base_url>/<rest>，因此 aliyun 与根路径形式的 tuna 可以混配。
+  # ---------------------------------------------------------------------------
+  pip:
+    route: /pip
+    upstreams:
+      - name: aliyun-pypi
+        base_url: https://mirrors.aliyun.com/pypi
+      - name: tuna-pypi
+        base_url: https://pypi.tuna.tsinghua.edu.cn
+    # 索引页重写：把页面中指向上游的绝对链接改写为 /pip/...，
+    # 使包文件下载也经过本代理缓存。
+    rewrite: true
+    # simple 索引页 30 分钟后台再校验（stale-while-revalidate）。
+    index_ttl: 30m
+    index_patterns:
+      - "^simple/"
+
+  # ---------------------------------------------------------------------------
+  # npm 源。客户端：
+  #   npm config set registry http://<proxy>:8080/npm/
+  # ---------------------------------------------------------------------------
+  npm:
+    route: /npm
+    upstreams:
+      - name: npmmirror
+        base_url: https://registry.npmmirror.com
+      - name: npmjs
+        base_url: https://registry.npmjs.org
+    # 重写元数据 JSON 中的 tarball/resolved 字段（按请求 Host 生成绝对地址）。
+    rewrite: true
+    # 包元数据（/npm/<pkg>、/npm/@scope/<pkg>）15 分钟后台再校验。
+    index_ttl: 15m
+    index_patterns:
+      - "^@[^/]+/[^/]+$"   # @scope/pkg（不带 .tgz 的元数据）
+      - "^[^/@][^/]*$"     # 普通包名（单段路径）
+    # 上游较慢时可为 npmjs 单独放宽超时：
+    # upstreams[1].timeout: 60s
+
+  # ---------------------------------------------------------------------------
+  # Maven 源。客户端 settings.xml：
+  #   <mirror>
+  #     <id>mirror-proxy</id>
+  #     <mirrorOf>central</mirrorOf>
+  #     <url>http://<proxy>:8080/mvn/</url>
+  #   </mirror>
+  # ---------------------------------------------------------------------------
+  mvn:
+    route: /mvn
+    upstreams:
+      - name: aliyun-maven
+        base_url: https://maven.aliyun.com/repository/public
+      - name: huawei-maven
+        base_url: https://repo.huaweicloud.com/repository/maven2
+    # maven-metadata.xml（SNAPSHOT/版本列表）30 分钟后台再校验；
+    # 构件本体（jar/pom/sha1）按版本号寻址，属不可变内容，永久缓存。
+    index_ttl: 30m
+    index_patterns:
+      - "(?:^|/)maven-metadata\\.xml$"
